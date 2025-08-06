@@ -2,6 +2,7 @@ import argparse
 import sys
 import json
 import time
+import os
 from datetime import datetime
 from functools import lru_cache
 from collections import defaultdict, deque
@@ -121,24 +122,22 @@ class CrosswalkMonitor:
         self.tracker = ObjectTracker()
         self.crossing_events = deque(maxlen=1000)  # Keep last 1000 events
         self.stats = defaultdict(int)
+        self.log_path = None
         
-    def setup_zones(self, frame_width, frame_height):
-        """Setup crosswalk zones - customize these coordinates for your specific crosswalk"""
-        # Example zones - YOU NEED TO ADJUST THESE FOR YOUR ACTUAL CROSSWALK
-        self.zones = {
-            'crosswalk': CrosswalkZone('pedestrian_crossing', [
-                (frame_width * 0.2, frame_height * 0.4),
-                (frame_width * 0.8, frame_height * 0.4),
-                (frame_width * 0.8, frame_height * 0.6),
-                (frame_width * 0.2, frame_height * 0.6)
-            ]),
-            'south_lane': CrosswalkZone('vehicle_lane_south', [
-                (frame_width * 0.1, frame_height * 0.58),
-                (frame_width * 0.9, frame_height * 0.58),
-                (frame_width * 0.9, frame_height * 1),
-                (frame_width * 0.1, frame_height * 1)
-            ])
-        }
+    def setup_zones_from_file(self, json_path, frame_width, frame_height):
+        """Setup zone boundaries with json"""
+        with open(json_path, "r") as f:
+            zone_data = json.load(f)
+
+        self.zones = {}
+        for key, value in zone_data.items():
+            name = value["name"]
+            norm_points = value["points"]
+            abs_points = [
+                (int(x * frame_width), int(y * frame_height))
+                for (x, y) in norm_points
+            ]
+            self.zones[key] = CrosswalkZone(name, abs_points)
         
     def log_crossing_event(self, object_type, zone_from, zone_to, confidence):
         """Log a crossing event"""
@@ -155,8 +154,7 @@ class CrosswalkMonitor:
         # Print to console for real-time monitoring
         print(f"CROSSING DETECTED: {object_type} from {zone_from} to {zone_to} (conf: {confidence:.2f})")
         
-        # Save to file (optional)
-        with open('logs/crossings.jsonl', 'a') as f:
+        with open(self.log_path, 'a') as f:
             f.write(json.dumps(event) + '\n')
     
     def analyze_detections(self, detections):
@@ -242,6 +240,14 @@ def get_labels():
     return labels
 
 
+def draw_detection_center(image, detection, color=(255, 255, 255)):
+    """Draw a small circle at the center of a detection box."""
+    x, y, w, h = detection.box
+    center_x = x + w // 2
+    center_y = y + h // 2
+    cv2.circle(image, (center_x, center_y), radius=3, color=color, thickness=-1)
+
+
 def draw_detections(request, stream="main"):
     """Draw the detections and zones onto the ISP output."""
     detections = last_results
@@ -254,7 +260,9 @@ def draw_detections(request, stream="main"):
             color = {
                 'crosswalk': (0, 255, 255),      # Yellow for crosswalk
                 'north_lane': (255, 0, 0),       # Blue for north lane  
-                'south_lane': (0, 0, 255)        # Red for south lane
+                'south_lane': (0, 0, 255),       # Red for south lane
+                'east_lane': (0, 255, 0),        # Green for east lane
+                'west_lane': (150, 75, 0),       # Brown for west lane        
             }.get(zone_name, (128, 128, 128))    # Gray for others
             
             # Draw zone boundary
@@ -308,6 +316,7 @@ def draw_detections(request, stream="main"):
 
             # Draw detection box
             cv2.rectangle(m.array, (x, y), (x + w, y + h), color, thickness=2)
+            draw_detection_center(m.array, detection, color)
 
         if intrinsics.preserve_aspect_ratio:
             b_x, b_y, b_w, b_h = imx500.get_roi_scaled(request)
@@ -336,12 +345,19 @@ def get_args():
                         help="Path to the labels file")
     parser.add_argument("--print-intrinsics", action="store_true",
                         help="Print JSON network_intrinsics then exit")
+    parser.add_argument("--zone-config", type=str, default="zones/test.json",
+                        help="Path to zone definition JSON")
     return parser.parse_args()
 
 
 if __name__ == "__main__":
     args = get_args()
     imx_model = r"/usr/share/imx500-models/imx500_network_nanodet_plus_416x416_pp.rpk"
+
+    zone_config_filename = os.path.splitext(os.path.basename(args.zone_config))[0]
+    log_path = os.path.join("logs", f"{zone_config_filename}.jsonl")
+
+    crosswalk_monitor.log_path = log_path
 
     # This must be called before instantiation of Picamera2
     imx500 = IMX500(imx_model)
@@ -377,12 +393,12 @@ if __name__ == "__main__":
     # Setup crosswalk zones based on camera resolution
     frame_width = config['main']['size'][0]
     frame_height = config['main']['size'][1]
-    crosswalk_monitor.setup_zones(frame_width, frame_height)
+    crosswalk_monitor.setup_zones_from_file(args.zone_config, frame_width, frame_height)
     
     print(f"Crosswalk Monitor Started!")
     print(f"Camera Resolution: {frame_width}x{frame_height}")
     print(f"Detection Threshold: {args.threshold}")
-    print(f"Logs will be saved to: logs/crossings.jsonl")
+    print(f"Logs will be saved to: {log_path}")
     print("="*50)
 
     imx500.show_network_fw_progress_bar()
@@ -411,5 +427,5 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         print("\nCrosswalk Monitor Stopped")
         print(f"Total Events Logged: {len(crosswalk_monitor.crossing_events)}")
-        print("Check logs/crossings.jsonl for detailed logs")
+        print(f"Logs will be saved to: {log_path}")
         picam2.stop()

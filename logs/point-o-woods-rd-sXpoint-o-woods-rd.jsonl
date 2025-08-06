@@ -1,0 +1,6 @@
+{"timestamp": "2025-08-05T22:14:57.834555", "object_type": "person", "from_zone": "south_lane", "to_zone": "crosswalk", "confidence": 0.8515625}
+{"timestamp": "2025-08-05T22:14:59.005674", "object_type": "person", "from_zone": "crosswalk", "to_zone": "south_lane", "confidence": 0.8515625}
+{"timestamp": "2025-08-05T22:15:01.487050", "object_type": "person", "from_zone": "south_lane", "to_zone": "crosswalk", "confidence": 0.81640625}
+{"timestamp": "2025-08-05T22:15:02.787615", "object_type": "person", "from_zone": "crosswalk", "to_zone": "south_lane", "confidence": 0.77734375}
+{"timestamp": "2025-08-05T22:15:02.831133", "object_type": "person", "from_zone": "south_lane", "to_zone": "crosswalk", "confidence": 0.77734375}
+{"timestamp": "2025-08-05T22:15:02.876775", "object_type": "person", "from_zone": "crosswalk", "to_zone": "south_lane", "confidence": 0.81640625}
