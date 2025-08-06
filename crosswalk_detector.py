@@ -67,30 +67,51 @@ class ObjectTracker:
         del self.objects[object_id]
         del self.disappeared[object_id]
         
-    def update(self, detections):
+    def update(self, detections, zones):
         """Update tracked objects with new detections"""
         if len(detections) == 0:
-            # Mark all existing objects as disappeared
             for object_id in list(self.disappeared.keys()):
                 self.disappeared[object_id] += 1
                 if self.disappeared[object_id] > self.max_disappeared:
                     self.deregister(object_id)
             return
-        
-        # Simple nearest-neighbor tracking (for production, use more sophisticated methods)
+
         if len(self.objects) == 0:
             for detection in detections:
                 self.register(detection)
         else:
-            # Match detections to existing objects (simplified)
             for detection in detections:
-                # For now, just update the first object (this is very basic)
-                # In production, you'd use distance/IoU matching
+                # Very simple matching to one object for now
                 if self.objects:
                     object_id = list(self.objects.keys())[0]
-                    self.objects[object_id]['detection'] = detection
-                    self.objects[object_id]['last_seen'] = time.time()
+                    obj = self.objects[object_id]
+
+                    prev_zones = obj['zone_history'][-1] if obj['zone_history'] else None
+
+                    # Determine current zone(s) for this detection
+                    current_zones = []
+                    for zone_name, zone in zones.items():
+                        if zone.contains_detection(detection):
+                            current_zones.append(zone_name)
+
+                    # Pick just one (or extend to support multiple later)
+                    current_zone = current_zones[0] if current_zones else None
+
+                    # Check for zone transition
+                    if prev_zones and current_zone and prev_zones != current_zone:
+                        crosswalk_monitor.log_crossing_event(
+                            object_type=get_labels()[int(detection.category)],
+                            zone_from=prev_zones,
+                            zone_to=current_zone,
+                            confidence=detection.conf
+                        )
+
+                    # Update the object
+                    obj['detection'] = detection
+                    obj['last_seen'] = time.time()
                     self.disappeared[object_id] = 0
+                    if current_zone:
+                        obj['zone_history'].append(current_zone)
 
 
 class CrosswalkMonitor:
@@ -111,17 +132,11 @@ class CrosswalkMonitor:
                 (frame_width * 0.8, frame_height * 0.6),
                 (frame_width * 0.2, frame_height * 0.6)
             ]),
-            'north_lane': CrosswalkZone('vehicle_lane_north', [
-                (frame_width * 0.1, frame_height * 0.1),
-                (frame_width * 0.9, frame_height * 0.1),
-                (frame_width * 0.9, frame_height * 0.35),
-                (frame_width * 0.1, frame_height * 0.35)
-            ]),
             'south_lane': CrosswalkZone('vehicle_lane_south', [
-                (frame_width * 0.1, frame_height * 0.65),
-                (frame_width * 0.9, frame_height * 0.65),
-                (frame_width * 0.9, frame_height * 0.9),
-                (frame_width * 0.1, frame_height * 0.9)
+                (frame_width * 0.1, frame_height * 0.58),
+                (frame_width * 0.9, frame_height * 0.58),
+                (frame_width * 0.9, frame_height * 1),
+                (frame_width * 0.1, frame_height * 1)
             ])
         }
         
@@ -132,7 +147,7 @@ class CrosswalkMonitor:
             'object_type': object_type,
             'from_zone': zone_from,
             'to_zone': zone_to,
-            'confidence': confidence
+            'confidence': float(confidence)
         }
         self.crossing_events.append(event)
         self.stats[f'{object_type}_crossings'] += 1
@@ -381,7 +396,18 @@ if __name__ == "__main__":
     
     try:
         while True:
-            last_results = parse_detections(picam2.capture_metadata())
+            metadata = picam2.capture_metadata()
+            last_results = parse_detections(metadata)
+
+            # Filter only relevant types
+            filtered = []
+            labels = get_labels()
+            for det in last_results:
+                object_type = labels[int(det.category)]
+                if object_type in ['person', 'car', 'truck', 'bus', 'bicycle', 'motorcycle']:
+                    filtered.append(det)
+
+            crosswalk_monitor.tracker.update(filtered, crosswalk_monitor.zones)
     except KeyboardInterrupt:
         print("\nCrosswalk Monitor Stopped")
         print(f"Total Events Logged: {len(crosswalk_monitor.crossing_events)}")
