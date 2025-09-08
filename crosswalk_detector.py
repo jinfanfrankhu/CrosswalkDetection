@@ -1,11 +1,29 @@
+import os
+print("=== ENVIRONMENT DEBUG ===")
+print(f"QT_QPA_PLATFORM: {os.environ.get('QT_QPA_PLATFORM', 'NOT SET')}")
+print(f"DISPLAY: {os.environ.get('DISPLAY', 'NOT SET')}")
+print(f"XDG_SESSION_TYPE: {os.environ.get('XDG_SESSION_TYPE', 'NOT SET')}")
+print(f"WAYLAND_DISPLAY: {os.environ.get('WAYLAND_DISPLAY', 'NOT SET')}")
+print("========================")
+
+# Set environment BEFORE any other imports
+os.environ['QT_QPA_PLATFORM'] = 'wayland'
+# Make sure DISPLAY is not set when using Wayland
+if 'DISPLAY' in os.environ:
+    del os.environ['DISPLAY']
+
+print(f"After setting - QT_QPA_PLATFORM: {os.environ.get('QT_QPA_PLATFORM')}")
+
 import argparse
 import sys
 import json
 import time
-import os
+import threading
 from datetime import datetime
 from functools import lru_cache
 from collections import defaultdict, deque
+from http.server import HTTPServer, BaseHTTPRequestHandler
+import socketserver
 
 import cv2
 import numpy as np
@@ -16,7 +34,8 @@ from picamera2.devices.imx500 import (NetworkIntrinsics,
                                       postprocess_nanodet_detection)
 
 last_detections = []
-
+latest_frame = None
+frame_lock = threading.Lock()
 
 class Detection:
     def __init__(self, coords, category, conf, metadata):
@@ -24,7 +43,6 @@ class Detection:
         self.category = category
         self.conf = conf
         self.box = imx500.convert_inference_coords(coords, metadata, picam2)
-
 
 class CrosswalkZone:
     """Define a zone (crosswalk, vehicle lane, etc.) using polygon coordinates"""
@@ -42,7 +60,6 @@ class CrosswalkZone:
         center_x = x + w // 2
         center_y = y + h // 2
         return self.contains_point(center_x, center_y)
-
 
 class ObjectTracker:
     """Simple object tracking to detect movement across zones"""
@@ -114,7 +131,6 @@ class ObjectTracker:
                     if current_zone:
                         obj['zone_history'].append(current_zone)
 
-
 class CrosswalkMonitor:
     """Main crosswalk monitoring system"""
     def __init__(self):
@@ -185,10 +201,112 @@ class CrosswalkMonitor:
                     if 'crosswalk' in current_zones and object_type in ['car', 'truck', 'bus']:
                         print(f"VEHICLE IN CROSSWALK! (confidence: {detection.conf:.2f})")
 
-
 # Initialize crosswalk monitor
 crosswalk_monitor = CrosswalkMonitor()
 
+# Web Server for Preview
+class StreamingHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path == '/':
+            self.send_response(200)
+            self.send_header('Content-type', 'text/html')
+            self.end_headers()
+            html = """
+            <!DOCTYPE html>
+            <html>
+            <head>
+                <title>Crosswalk Monitor</title>
+                <style>
+                    body { font-family: Arial, sans-serif; background: #1a1a1a; color: white; margin: 0; padding: 20px; }
+                    .container { max-width: 1200px; margin: 0 auto; }
+                    h1 { color: #ffcc00; text-align: center; }
+                    .video-container { text-align: center; margin: 20px 0; }
+                    .stats { background: #333; padding: 15px; border-radius: 8px; margin: 20px 0; }
+                    .status { color: #00ff00; font-weight: bold; }
+                    img { border: 2px solid #555; border-radius: 8px; max-width: 100%; }
+                    .controls { text-align: center; margin: 10px 0; }
+                    button { background: #ffcc00; color: black; border: none; padding: 10px 20px; border-radius: 5px; cursor: pointer; }
+                    button:hover { background: #ffd700; }
+                </style>
+            </head>
+            <body>
+                <div class="container">
+                    <h1>🚦 Crosswalk Detection Monitor</h1>
+                    <div class="stats">
+                        <div class="status">● LIVE FEED ACTIVE</div>
+                        <p>Detection Threshold: 0.55 | Resolution: 640x480</p>
+                    </div>
+                    <div class="video-container">
+                        <img id="stream" src="/stream.mjpg" alt="Crosswalk Monitor Feed">
+                    </div>
+                    <div class="controls">
+                        <button onclick="location.reload()">Refresh Feed</button>
+                        <button onclick="toggleFullscreen()">Toggle Fullscreen</button>
+                    </div>
+                </div>
+                <script>
+                    function toggleFullscreen() {
+                        const img = document.getElementById('stream');
+                        if (img.requestFullscreen) {
+                            img.requestFullscreen();
+                        }
+                    }
+                    // Auto-refresh if stream fails
+                    document.getElementById('stream').onerror = function() {
+                        setTimeout(() => location.reload(), 2000);
+                    };
+                </script>
+            </body>
+            </html>
+            """
+            self.wfile.write(html.encode())
+            
+        elif self.path == '/stream.mjpg':
+            self.send_response(200)
+            self.send_header('Content-Type', 'multipart/x-mixed-replace; boundary=--jpgboundary')
+            self.end_headers()
+            
+            while True:
+                try:
+                    with frame_lock:
+                        if latest_frame is not None:
+                            _, jpeg = cv2.imencode('.jpg', latest_frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
+                            frame_data = jpeg.tobytes()
+                        else:
+                            # Create a placeholder frame
+                            placeholder = np.zeros((480, 640, 3), dtype=np.uint8)
+                            cv2.putText(placeholder, 'Starting Camera...', (150, 240), 
+                                       cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+                            _, jpeg = cv2.imencode('.jpg', placeholder)
+                            frame_data = jpeg.tobytes()
+                    
+                    self.wfile.write(b'--jpgboundary\r\n')
+                    self.send_header('Content-Type', 'image/jpeg')
+                    self.send_header('Content-Length', str(len(frame_data)))
+                    self.end_headers()
+                    self.wfile.write(frame_data)
+                    self.wfile.write(b'\r\n')
+                    
+                    time.sleep(0.1)  # ~10 FPS for web stream
+                    
+                except Exception as e:
+                    print(f"Streaming error: {e}")
+                    break
+
+def start_web_server(port=8080):
+    """Start the web server in a separate thread"""
+    def run_server():
+        try:
+            server = HTTPServer(('0.0.0.0', port), StreamingHandler)
+            print(f"🌐 Web preview available at http://raspberry_pi_ip:{port}")
+            print(f"🌐 Local access: http://localhost:{port}")
+            server.serve_forever()
+        except Exception as e:
+            print(f"Web server error: {e}")
+    
+    thread = threading.Thread(target=run_server, daemon=True)
+    thread.start()
+    return thread
 
 def parse_detections(metadata: dict):
     """Parse the output tensor into a number of detected objects, scaled to the ISP output."""
@@ -230,105 +348,85 @@ def parse_detections(metadata: dict):
     
     return last_detections
 
-
 @lru_cache
 def get_labels():
     labels = intrinsics.labels
-
     if intrinsics.ignore_dash_labels:
         labels = [label for label in labels if label and label != "-"]
     return labels
 
-
-def draw_detection_center(image, detection, color=(255, 255, 255)):
-    """Draw a small circle at the center of a detection box."""
-    x, y, w, h = detection.box
-    center_x = x + w // 2
-    center_y = y + h // 2
-    cv2.circle(image, (center_x, center_y), radius=3, color=color, thickness=-1)
-
-
-def draw_detections(request, stream="main"):
-    """Draw the detections and zones onto the ISP output."""
-    detections = last_results
+def draw_detections_on_array(frame, detections, zones):
+    """Draw detections and zones directly on a numpy array for web display"""
     if detections is None:
-        return
+        return frame
+    
     labels = get_labels()
-    with MappedArray(request, stream) as m:
-        # Draw crosswalk zones first
-        for zone_name, zone in crosswalk_monitor.zones.items():
-            color = {
-                'crosswalk': (0, 255, 255),      # Yellow for crosswalk
-                'north_lane': (255, 0, 0),       # Blue for north lane  
-                'south_lane': (0, 0, 255),       # Red for south lane
-                'east_lane': (0, 255, 0),        # Green for east lane
-                'west_lane': (150, 75, 0),       # Brown for west lane        
-            }.get(zone_name, (128, 128, 128))    # Gray for others
-            
-            # Draw zone boundary
-            cv2.polylines(m.array, [zone.points], True, color, 2)
-            
-            for point in zone.points:
-                cv2.circle(m.array, tuple(point), radius=5, color=color, thickness=-1)
-            
-            # Label the zone
-            cv2.putText(m.array, zone_name.upper(), 
-                       tuple(zone.points[0]), cv2.FONT_HERSHEY_SIMPLEX, 
-                       0.6, color, 2)
+    
+    # Draw crosswalk zones first
+    for zone_name, zone in zones.items():
+        color = {
+            'crosswalk': (0, 255, 255),      # Yellow for crosswalk
+            'north_lane': (255, 0, 0),       # Blue for north lane  
+            'south_lane': (0, 0, 255),       # Red for south lane
+            'east_lane': (0, 255, 0),        # Green for east lane
+            'west_lane': (150, 75, 0),       # Brown for west lane        
+        }.get(zone_name, (128, 128, 128))    # Gray for others
         
-        # Draw detections
-        for detection in detections:
-            x, y, w, h = detection.box
-            object_type = labels[int(detection.category)]
-            label = f"{object_type} ({detection.conf:.2f})"
+        # Draw zone boundary
+        cv2.polylines(frame, [zone.points], True, color, 2)
+        
+        # Draw corner points
+        for point in zone.points:
+            cv2.circle(frame, tuple(point), radius=5, color=color, thickness=-1)
+        
+        # Label the zone
+        cv2.putText(frame, zone_name.upper(), 
+                   tuple(zone.points[0]), cv2.FONT_HERSHEY_SIMPLEX, 
+                   0.6, color, 2)
+    
+    # Draw detections
+    for detection in detections:
+        x, y, w, h = detection.box
+        object_type = labels[int(detection.category)]
+        label = f"{object_type} ({detection.conf:.2f})"
 
-            # Color code by object type
-            color = {
-                'person': (0, 255, 0),      # Green for people
-                'car': (255, 0, 0),         # Blue for cars
-                'truck': (255, 0, 0),       # Blue for trucks
-                'bus': (255, 0, 0),         # Blue for buses
-                'bicycle': (0, 255, 255),   # Yellow for bikes
-                'motorcycle': (0, 255, 255) # Yellow for motorcycles
-            }.get(object_type, (255, 255, 255))  # White for others
+        # Color code by object type
+        color = {
+            'person': (0, 255, 0),      # Green for people
+            'car': (255, 0, 0),         # Blue for cars
+            'truck': (255, 0, 0),       # Blue for trucks
+            'bus': (255, 0, 0),         # Blue for buses
+            'bicycle': (0, 255, 255),   # Yellow for bikes
+            'motorcycle': (0, 255, 255) # Yellow for motorcycles
+        }.get(object_type, (255, 255, 255))  # White for others
 
-            # Calculate text size and position
-            (text_width, text_height), baseline = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
-            text_x = x + 5
-            text_y = y + 15
-
-            # Create a copy of the array to draw the background with opacity
-            overlay = m.array.copy()
-
-            # Draw the background rectangle on the overlay
-            cv2.rectangle(overlay,
-                          (text_x, text_y - text_height),
-                          (text_x + text_width, text_y + baseline),
-                          (255, 255, 255),  # Background color (white)
-                          cv2.FILLED)
-
-            alpha = 0.30
-            cv2.addWeighted(overlay, alpha, m.array, 1 - alpha, 0, m.array)
-
-            # Draw text on top of the background
-            cv2.putText(m.array, label, (text_x, text_y),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
-
-            # Draw detection box
-            cv2.rectangle(m.array, (x, y), (x + w, y + h), color, thickness=2)
-            draw_detection_center(m.array, detection, color)
-
-        if intrinsics.preserve_aspect_ratio:
-            b_x, b_y, b_w, b_h = imx500.get_roi_scaled(request)
-            color = (255, 0, 0)  # red
-            cv2.putText(m.array, "ROI", (b_x + 5, b_y + 15), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
-            cv2.rectangle(m.array, (b_x, b_y), (b_x + b_w, b_y + b_h), (255, 0, 0, 0))
-
+        # Draw detection box
+        cv2.rectangle(frame, (x, y), (x + w, y + h), color, thickness=2)
+        
+        # Draw center point
+        center_x = x + w // 2
+        center_y = y + h // 2
+        cv2.circle(frame, (center_x, center_y), radius=3, color=color, thickness=-1)
+        
+        # Draw label with background
+        (text_width, text_height), baseline = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+        text_x = x + 5
+        text_y = y + 15
+        
+        # Background rectangle
+        cv2.rectangle(frame, 
+                     (text_x, text_y - text_height), 
+                     (text_x + text_width, text_y + baseline),
+                     (255, 255, 255), cv2.FILLED)
+        
+        # Text
+        cv2.putText(frame, label, (text_x, text_y),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+    
+    return frame
 
 def get_args():
     parser = argparse.ArgumentParser()
-#     parser.add_argument("--model", type=str, help="Path of the model",
-#                         default="/usr/share/imx500-models/imx500_network_nanodet_plus_416x416_pp.rpk")
     parser.add_argument("--fps", type=int, help="Frames per second")
     parser.add_argument("--bbox-normalization", action=argparse.BooleanOptionalAction, help="Normalize bbox")
     parser.add_argument("--bbox-order", choices=["yx", "xy"], default="yx",
@@ -341,14 +439,13 @@ def get_args():
                         default=None, help="Run post process of type")
     parser.add_argument("-r", "--preserve-aspect-ratio", action=argparse.BooleanOptionalAction,
                         help="preserve the pixel aspect ratio of the input tensor")
-    parser.add_argument("--labels", type=str,
-                        help="Path to the labels file")
+    parser.add_argument("--labels", type=str, help="Path to the labels file")
     parser.add_argument("--print-intrinsics", action="store_true",
                         help="Print JSON network_intrinsics then exit")
     parser.add_argument("--zone-config", type=str, default="zones/test.json",
                         help="Path to zone definition JSON")
+    parser.add_argument("--web-port", type=int, default=8080, help="Web server port")
     return parser.parse_args()
-
 
 if __name__ == "__main__":
     args = get_args()
@@ -356,7 +453,6 @@ if __name__ == "__main__":
 
     zone_config_filename = os.path.splitext(os.path.basename(args.zone_config))[0]
     log_path = os.path.join("logs", f"{zone_config_filename}.jsonl")
-
     crosswalk_monitor.log_path = log_path
 
     # This must be called before instantiation of Picamera2
@@ -388,27 +484,34 @@ if __name__ == "__main__":
         exit()
 
     picam2 = Picamera2(imx500.camera_num)
-    config = picam2.create_preview_configuration(controls={"FrameRate": intrinsics.inference_rate}, buffer_count=12)
-
+    config = picam2.create_preview_configuration()
+    if intrinsics.inference_rate:
+        config["controls"] = {"FrameRate": intrinsics.inference_rate}
+        
     # Setup crosswalk zones based on camera resolution
     frame_width = config['main']['size'][0]
     frame_height = config['main']['size'][1]
     crosswalk_monitor.setup_zones_from_file(args.zone_config, frame_width, frame_height)
     
-    print(f"Crosswalk Monitor Started!")
-    print(f"Camera Resolution: {frame_width}x{frame_height}")
-    print(f"Detection Threshold: {args.threshold}")
-    print(f"Logs will be saved to: {log_path}")
+    print(f"🚦 Crosswalk Monitor Started!")
+    print(f"📹 Camera Resolution: {frame_width}x{frame_height}")
+    print(f"🎯 Detection Threshold: {args.threshold}")
+    print(f"📝 Logs will be saved to: {log_path}")
     print("="*50)
 
+    # Start web server
+    start_web_server(args.web_port)
+
     imx500.show_network_fw_progress_bar()
-    picam2.start(config, show_preview=True)
+    
+    print("Starting camera...")
+    picam2.start(config, show_preview=False)  # No Qt preview needed
+    print("Camera started successfully!")
 
     if intrinsics.preserve_aspect_ratio:
         imx500.set_auto_aspect_ratio()
 
     last_results = None
-    picam2.pre_callback = draw_detections
     
     try:
         while True:
@@ -424,8 +527,21 @@ if __name__ == "__main__":
                     filtered.append(det)
 
             crosswalk_monitor.tracker.update(filtered, crosswalk_monitor.zones)
+            
+            # Update web frame
+            try:
+                frame = picam2.capture_array()
+                frame_with_overlay = draw_detections_on_array(frame, last_results, crosswalk_monitor.zones)
+                
+                # Update the global frame for web streaming
+                with frame_lock:
+                    latest_frame = frame_with_overlay.copy()
+                    
+            except Exception as e:
+                print(f"Frame processing error: {e}")
+                
     except KeyboardInterrupt:
-        print("\nCrosswalk Monitor Stopped")
-        print(f"Total Events Logged: {len(crosswalk_monitor.crossing_events)}")
-        print(f"Logs will be saved to: {log_path}")
+        print("\n🛑 Crosswalk Monitor Stopped")
+        print(f"📊 Total Events Logged: {len(crosswalk_monitor.crossing_events)}")
+        print(f"📝 Logs saved to: {log_path}")
         picam2.stop()

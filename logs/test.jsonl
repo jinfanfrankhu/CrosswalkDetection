@@ -1,0 +1,12 @@
+{"timestamp": "2025-09-07T19:20:09.926142", "object_type": "person", "from_zone": "crosswalk", "to_zone": "south_lane", "confidence": 0.8515625}
+{"timestamp": "2025-09-07T19:20:10.364283", "object_type": "person", "from_zone": "south_lane", "to_zone": "crosswalk", "confidence": 0.8359375}
+{"timestamp": "2025-09-07T19:42:55.187410", "object_type": "person", "from_zone": "south_lane", "to_zone": "crosswalk", "confidence": 0.8515625}
+{"timestamp": "2025-09-07T20:45:16.955592", "object_type": "person", "from_zone": "crosswalk", "to_zone": "south_lane", "confidence": 0.8671875}
+{"timestamp": "2025-09-07T20:48:59.928929", "object_type": "person", "from_zone": "crosswalk", "to_zone": "south_lane", "confidence": 0.59375}
+{"timestamp": "2025-09-07T20:49:00.019515", "object_type": "person", "from_zone": "south_lane", "to_zone": "crosswalk", "confidence": 0.77734375}
+{"timestamp": "2025-09-07T20:49:41.561250", "object_type": "person", "from_zone": "crosswalk", "to_zone": "south_lane", "confidence": 0.8671875}
+{"timestamp": "2025-09-07T20:49:48.945168", "object_type": "person", "from_zone": "south_lane", "to_zone": "crosswalk", "confidence": 0.8359375}
+{"timestamp": "2025-09-07T20:49:49.380148", "object_type": "person", "from_zone": "crosswalk", "to_zone": "south_lane", "confidence": 0.8359375}
+{"timestamp": "2025-09-07T20:49:54.682246", "object_type": "person", "from_zone": "south_lane", "to_zone": "crosswalk", "confidence": 0.796875}
+{"timestamp": "2025-09-07T20:50:02.070870", "object_type": "person", "from_zone": "crosswalk", "to_zone": "south_lane", "confidence": 0.6796875}
+{"timestamp": "2025-09-07T20:50:02.157520", "object_type": "person", "from_zone": "south_lane", "to_zone": "crosswalk", "confidence": 0.65234375}
