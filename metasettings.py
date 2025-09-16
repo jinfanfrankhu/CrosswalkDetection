@@ -27,9 +27,19 @@ SYSTEM_CONFIG = {
     "labels_file": str(ASSETS_DIR / "coco_labels.txt"),
     
     # Detection Parameters
-    "detection_threshold": 0.55,
+    "detection_threshold": 0.55,  # Default threshold for all objects
     "iou_threshold": 0.65,
     "max_detections": 10,
+
+    # Per-object detection thresholds (overrides default if specified)
+    "object_thresholds": {
+        "person": 0.50,      # Lower threshold for people (more sensitive)
+        "car": 0.55,         # Standard threshold for vehicles
+        "truck": 0.55,
+        "bus": 0.55,
+        "bicycle": 0.50,     # Lower threshold for smaller objects
+        "motorcycle": 0.50
+    },
     
     # Web Server Settings
     "web_port": 8080,
@@ -37,7 +47,8 @@ SYSTEM_CONFIG = {
     "jpeg_quality": 85,
     
     # Tracking Settings
-    "max_disappeared_frames": 10,
+    "max_disappeared_frames": 5,   # Shorter timeout for unreliable detection
+    "max_tracking_distance": 100,
     "max_crossing_events": 1000,
     
     # Relevant object types for tracking
@@ -281,9 +292,12 @@ def load_zone_file(zone_filename):
         fixed_zones_data[zone_key] = fixed_zone_info
 
     # Convert to the expected format
+    # Use just the base filename (without .json) as the clean zone name
+    clean_zone_name = Path(zone_filename).stem
+
     zone_config = {
-        "name": f"External Zone Config: {zone_filename}",
-        "description": f"Loaded from {zone_filename}",
+        "name": clean_zone_name,
+        "description": f"External zone configuration loaded from {zone_filename}",
         "zones": fixed_zones_data
     }
 
@@ -362,15 +376,31 @@ def get_log_path():
 def get_system_setting(key, default=None):
     """
     Get a system configuration setting.
-    
+
     Args:
         key: Setting key to retrieve
         default: Default value if key not found
-        
+
     Returns:
         Configuration value or default
     """
     return SYSTEM_CONFIG.get(key, default)
+
+def get_detection_threshold(object_type=None):
+    """
+    Get the detection threshold for a specific object type.
+
+    Args:
+        object_type: Type of object (e.g., 'person', 'car'). If None, returns default threshold.
+
+    Returns:
+        float: Detection threshold for the object type
+    """
+    if object_type is None:
+        return SYSTEM_CONFIG.get("detection_threshold", 0.55)
+
+    object_thresholds = SYSTEM_CONFIG.get("object_thresholds", {})
+    return object_thresholds.get(object_type, SYSTEM_CONFIG.get("detection_threshold", 0.55))
 
 def list_available_configs():
     """

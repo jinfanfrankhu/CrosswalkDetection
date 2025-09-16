@@ -11,13 +11,35 @@ import cv2
 import threading
 import time
 import argparse
+import numpy as np
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import parse_qs, urlparse
 from picamera2 import Picamera2
 
+# Local imports
+from metasettings import (
+    get_active_zone_config,
+    get_system_setting,
+    set_external_zone_file
+)
+
+class CrosswalkZone:
+    """Define a zone (crosswalk, vehicle lane, etc.) using polygon coordinates."""
+
+    def __init__(self, name, polygon_points):
+        """
+        Initialize a zone with a name and polygon boundary points.
+
+        Args:
+            name: Zone identifier (e.g., 'crosswalk', 'north_lane')
+            polygon_points: List of (x, y) coordinates defining the zone boundary
+        """
+        self.name = name
+        self.points = np.array(polygon_points, dtype=np.int32)
+
 class CoordinateFinder:
     """Camera streaming app for finding coordinates by clicking"""
-    
+
     def __init__(self):
         self.latest_frame = None
         self.frame_lock = threading.Lock()
@@ -25,6 +47,7 @@ class CoordinateFinder:
         self.picam2 = None
         self.frame_width = 1280
         self.frame_height = 720
+        self.zones = {}
         
     def get_latest_frame(self):
         """Thread-safe method to get the latest frame"""
@@ -48,6 +71,27 @@ class CoordinateFinder:
         """Clear all clicked points"""
         self.clicked_points.clear()
         print("Cleared all points")
+
+    def setup_zones_from_metasettings(self):
+        """
+        Load zone definitions from metasettings and convert to absolute coordinates.
+        """
+        zone_config = get_active_zone_config()
+        zone_data = zone_config['zones']
+
+        self.zones = {}
+        for key, value in zone_data.items():
+            name = value["name"]
+            norm_points = value["points"]
+            abs_points = [
+                (int(x * self.frame_width), int(y * self.frame_height))
+                for (x, y) in norm_points
+            ]
+            self.zones[key] = CrosswalkZone(name, abs_points)
+
+        print(f"Loaded {len(self.zones)} zones from configuration: {zone_config['name']}")
+        for zone_name, zone in self.zones.items():
+            print(f"  - {zone_name}: {zone.name}")
 
 class CoordinateHandler(BaseHTTPRequestHandler):
     """HTTP handler for coordinate finding interface"""
@@ -170,6 +214,7 @@ class CoordinateHandler(BaseHTTPRequestHandler):
                     <h3>Instructions:</h3>
                     <ul>
                         <li><strong>Click on the image</strong> to get pixel coordinates</li>
+                        <li>Zone boundaries are overlaid in different colors (if configured)</li>
                         <li>Use these coordinates to define zones in your crosswalk detector</li>
                         <li>Camera resolution: {self.app.frame_width}x{self.app.frame_height}</li>
                         <li>For normalized coordinates (0.0-1.0), divide X by {self.app.frame_width} and Y by {self.app.frame_height}</li>
@@ -186,6 +231,10 @@ class CoordinateHandler(BaseHTTPRequestHandler):
                 <div class="coordinates" id="coordinates">
                     <strong>Clicked Coordinates:</strong><br>
                     Click on the image above to see coordinates here...
+                </div>
+                <div class="stats">
+                    <strong>Loaded Zones:</strong><br>
+                    {self._format_zones_info()}
                 </div>
             </div>
             <script>
@@ -422,27 +471,40 @@ class CoordinateHandler(BaseHTTPRequestHandler):
         </html>
         """
         self.wfile.write(html.encode())
+
+    def _format_zones_info(self):
+        """Format zone information for HTML display"""
+        if not self.app.zones:
+            return "No zones configured"
+
+        zone_info = []
+        for zone_name, zone in self.app.zones.items():
+            zone_info.append(f"{zone_name}: {zone.name}")
+        return "<br>".join(zone_info)
     
     def _serve_video_stream(self):
         """Serve the MJPEG video stream with coordinate overlay"""
         self.send_response(200)
         self.send_header('Content-Type', 'multipart/x-mixed-replace; boundary=--jpgboundary')
         self.end_headers()
-        
+
         while True:
             try:
                 frame = self.app.get_latest_frame()
                 if frame is not None:
+                    # Draw zones first (so they appear behind points)
+                    self._draw_zones_on_frame(frame)
+
                     # Draw clicked points on the frame
                     for i, (x, y) in enumerate(self.app.clicked_points):
                         # Draw point
                         cv2.circle(frame, (x, y), radius=5, color=(0, 255, 0), thickness=-1)
                         # Draw label with coordinates
                         label = f"({x},{y})"
-                        cv2.putText(frame, label, (x + 10, y - 10), 
+                        cv2.putText(frame, label, (x + 10, y - 10),
                                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
                         # Draw point number
-                        cv2.putText(frame, str(i + 1), (x - 15, y + 5), 
+                        cv2.putText(frame, str(i + 1), (x - 15, y + 5),
                                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 0), 1)
                     
                     _, jpeg = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
@@ -467,6 +529,40 @@ class CoordinateHandler(BaseHTTPRequestHandler):
             except Exception as e:
                 print(f"Streaming error: {e}")
                 break
+
+    def _draw_zones_on_frame(self, frame):
+        """
+        Draw zone boundaries on the video frame for visualization.
+
+        Args:
+            frame: OpenCV frame array to draw on
+        """
+        # Get zone colors from system settings, or use defaults
+        zone_colors = get_system_setting('zone_colors', {})
+        default_colors = {
+            'crosswalk': (0, 255, 255),  # Yellow
+            'north_lane': (255, 0, 0),   # Blue
+            'south_lane': (0, 0, 255),   # Red
+            'sidewalk': (128, 128, 128), # Gray
+            'default': (255, 255, 255)   # White
+        }
+
+        for zone_name, zone in self.app.zones.items():
+            # Get color for this zone type
+            color = zone_colors.get(zone_name, default_colors.get(zone_name, default_colors['default']))
+
+            # Draw zone boundary
+            cv2.polylines(frame, [zone.points], True, color, 2)
+
+            # Draw corner points
+            for point in zone.points:
+                cv2.circle(frame, tuple(point), radius=4, color=color, thickness=-1)
+
+            # Label the zone
+            if len(zone.points) > 0:
+                cv2.putText(frame, zone_name.upper(),
+                           tuple(zone.points[0]), cv2.FONT_HERSHEY_SIMPLEX,
+                           0.6, color, 2)
 
 class WebServer:
     """Web server for coordinate finding interface"""
@@ -494,19 +590,32 @@ def get_args():
     parser.add_argument("--port", type=int, default=8081, help="Web server port (default: 8081)")
     parser.add_argument("--width", type=int, default=1280, help="Camera width (default: 1280)")
     parser.add_argument("--height", type=int, default=720, help="Camera height (default: 720)")
+    parser.add_argument("--zone-config", type=str, help="Zone configuration file to load (e.g., 'chapel-crosswalk')")
     return parser.parse_args()
 
 def main():
     """Main function"""
     args = get_args()
-    
+
+    # Set external zone file if specified
+    if args.zone_config:
+        set_external_zone_file(args.zone_config)
+        print(f"Using external zone configuration: {args.zone_config}")
+
     print("Zone Coordinate Finder")
     print("=" * 30)
-    
+
     # Initialize the coordinate finder app
     app = CoordinateFinder()
     app.frame_width = args.width
     app.frame_height = args.height
+
+    # Setup zones from metasettings
+    try:
+        app.setup_zones_from_metasettings()
+    except Exception as e:
+        print(f"Warning: Could not load zone configuration: {e}")
+        print("Continuing without zone overlay...")
     
     # Initialize camera
     print("Initializing camera...")

@@ -31,6 +31,7 @@ from metasettings import (
     get_active_zone_config,
     get_log_path,
     get_system_setting,
+    get_detection_threshold,
     set_external_zone_file,
     SYSTEM_CONFIG
 )
@@ -81,45 +82,58 @@ class CrosswalkZone:
     def contains_detection(self, detection):
         """
         Check if detection center is inside this zone.
-        
+        Uses weighted center point for better vehicle detection.
+
         Args:
             detection: Detection object to test
-            
+
         Returns:
             bool: True if detection center is in this zone
         """
         x, y, w, h = detection.box
         center_x = x + w // 2
-        center_y = y + h // 2
+
+        # Weight the center point lower for better vehicle detection
+        # For vehicles, the important part is closer to the bottom of the bounding box
+        center_y = y + int(h * 0.75)  # 75% down from top instead of 50%
+
         return self.contains_point(center_x, center_y)
 
-class ObjectTracker:
-    """Simple object tracking to detect movement across zones."""
-    
-    def __init__(self, max_disappeared=10):
+class TriggerBasedTracker:
+    """Simple trigger-based crossing detection that works with unreliable object detection."""
+
+    def __init__(self, max_disappeared=5, max_distance=100):
         """
-        Initialize object tracker.
-        
+        Initialize trigger-based tracker.
+
         Args:
             max_disappeared: Maximum frames an object can be missing before removal
+            max_distance: Maximum pixel distance for object matching
         """
         self.next_object_id = 0
         self.objects = {}
         self.disappeared = {}
         self.max_disappeared = max_disappeared
-        
+        self.max_distance = max_distance
+        self.recent_triggers = {}  # Track recent triggers to avoid duplicates
+
     def register(self, detection):
         """
         Register a new object for tracking.
-        
+
         Args:
             detection: Detection object to start tracking
         """
+        center_x, center_y = self._get_detection_center(detection)
+
         self.objects[self.next_object_id] = {
             'detection': detection,
-            'zone_history': [],
+            'current_zone': None,
+            'last_zone': None,
+            'position': (center_x, center_y),
             'first_seen': time.time(),
-            'last_seen': time.time()
+            'last_seen': time.time(),
+            'object_type': None
         }
         self.disappeared[self.next_object_id] = 0
         self.next_object_id += 1
@@ -127,21 +141,150 @@ class ObjectTracker:
     def deregister(self, object_id):
         """
         Remove an object from tracking.
-        
+
         Args:
             object_id: ID of object to remove from tracking
         """
         del self.objects[object_id]
         del self.disappeared[object_id]
-        
+
+    def _calculate_distance(self, center1, center2):
+        """Calculate Euclidean distance between two points."""
+        return np.sqrt((center1[0] - center2[0])**2 + (center1[1] - center2[1])**2)
+
+    def _get_detection_center(self, detection):
+        """
+        Get weighted center point of a detection.
+        Uses lower weighting for better vehicle tracking.
+        """
+        x, y, w, h = detection.box
+        center_x = x + w // 2
+        # Weight center point lower (75% down) for better vehicle detection
+        center_y = y + int(h * 0.75)
+        return (center_x, center_y)
+
+    def _match_detections_to_objects(self, detections):
+        """
+        Match current detections to existing tracked objects.
+        Returns list of (object_id, detection) pairs and unmatched detections.
+        """
+        if not self.objects:
+            return [], detections
+
+        matches = []
+        unmatched_detections = []
+
+        for detection in detections:
+            detection_center = self._get_detection_center(detection)
+            best_match = None
+            min_distance = float('inf')
+
+            for object_id, obj in self.objects.items():
+                if obj['position_history']:
+                    last_position = obj['position_history'][-1]
+                    distance = self._calculate_distance(detection_center, last_position)
+
+                    if distance < min_distance and distance < self.max_distance:
+                        min_distance = distance
+                        best_match = object_id
+
+            if best_match is not None:
+                matches.append((best_match, detection))
+            else:
+                unmatched_detections.append(detection)
+
+        return matches, unmatched_detections
+
+    def _should_trigger_crossing(self, object_type, from_zone, to_zone):
+        """
+        Determine if a zone transition should trigger a crossing event.
+
+        Args:
+            object_type: Type of detected object
+            from_zone: Zone object was moving from
+            to_zone: Zone object is moving to
+
+        Returns:
+            bool: True if this transition should log a crossing
+        """
+        if not from_zone or not to_zone:
+            return False
+
+        # Vehicle crossing rules: main_road → crosswalk = immediate violation/crossing
+        if object_type in ['car', 'truck', 'bus', 'motorcycle']:
+            if from_zone == 'main_road' and to_zone == 'crosswalk':
+                return True
+
+        # Pedestrian crossing rules: any → crosswalk = crossing attempt
+        elif object_type in ['person', 'pedestrian']:
+            if to_zone == 'crosswalk' and from_zone != 'crosswalk':
+                return True
+
+        return False
+
+    def _get_trigger_key(self, object_type, from_zone, to_zone):
+        """Generate a key for tracking recent triggers to avoid duplicates."""
+        return f"{object_type}_{from_zone}_{to_zone}"
+
+    def _can_trigger(self, trigger_key, obj, cooldown_seconds=10):
+        """
+        Check if enough time has passed since last trigger of this type.
+        Implements distance-based reset for vehicles approaching from earlier positions.
+
+        Args:
+            trigger_key: Unique key for this trigger type
+            obj: Object data containing position and type information
+            cooldown_seconds: Minimum seconds between same triggers
+
+        Returns:
+            bool: True if trigger is allowed
+        """
+        current_time = time.time()
+        current_position = obj['position']
+
+        if trigger_key in self.recent_triggers:
+            last_data = self.recent_triggers[trigger_key]
+            time_since_last = current_time - last_data['time']
+
+            # Distance-based reset for vehicles
+            if obj['object_type'] in ['car', 'truck', 'bus', 'motorcycle']:
+                last_position = last_data.get('position')
+                if last_position:
+                    # Calculate Euclidean distance between current and last position
+                    distance = self._calculate_distance(current_position, last_position)
+
+                    # If vehicle is detected 100+ pixels away from last trigger position,
+                    # this likely indicates a different vehicle, so reset cooldown
+                    if distance > 100:
+                        print(f"🔄 Cooldown reset: {obj['object_type']} detected {distance:.0f}px away from last trigger (likely new vehicle)")
+                        self.recent_triggers[trigger_key] = {
+                            'time': current_time,
+                            'position': current_position
+                        }
+                        return True
+
+            # Standard cooldown check
+            if time_since_last < cooldown_seconds:
+                return False
+
+        # Update trigger record with position data
+        self.recent_triggers[trigger_key] = {
+            'time': current_time,
+            'position': current_position
+        }
+        return True
+
     def update(self, detections, zones):
         """
-        Update tracked objects with new detections and detect zone crossings.
-        
+        Trigger-based update method that logs crossings immediately on specific zone transitions.
+
         Args:
             detections: List of current frame detections
             zones: Dictionary of zone objects for boundary checking
         """
+        labels = get_labels(app)
+
+        # Handle case where no detections are found
         if len(detections) == 0:
             for object_id in list(self.disappeared.keys()):
                 self.disappeared[object_id] += 1
@@ -149,55 +292,98 @@ class ObjectTracker:
                     self.deregister(object_id)
             return
 
-        if len(self.objects) == 0:
-            for detection in detections:
-                self.register(detection)
+        # Match detections to existing objects
+        matches, unmatched_detections = self._match_detections_to_objects(detections)
+
+        # Update matched objects and check for trigger events
+        for object_id, detection in matches:
+            obj = self.objects[object_id]
+            detection_center = self._get_detection_center(detection)
+
+            # Update object info
+            obj['detection'] = detection
+            obj['last_seen'] = time.time()
+            obj['object_type'] = labels[int(detection.category)]
+            obj['position'] = detection_center
+            self.disappeared[object_id] = 0
+
+            # Determine current zone for this detection
+            current_zone = None
+            for zone_name, zone in zones.items():
+                if zone.contains_detection(detection):
+                    current_zone = zone_name
+                    break  # Take first match
+
+            # Check for zone transition and trigger events
+            if current_zone != obj['current_zone']:
+                from_zone = obj['current_zone']
+                to_zone = current_zone
+
+                # Update zone tracking
+                obj['last_zone'] = from_zone
+                obj['current_zone'] = to_zone
+
+                # Check if this transition should trigger a crossing event
+                if self._should_trigger_crossing(obj['object_type'], from_zone, to_zone):
+                    trigger_key = self._get_trigger_key(obj['object_type'], from_zone, to_zone)
+
+                    # Only trigger if cooldown period has passed (with distance-based reset)
+                    if self._can_trigger(trigger_key, obj):
+                        self._log_immediate_crossing(obj, from_zone, to_zone)
+
+        # Register new objects for unmatched detections
+        for detection in unmatched_detections:
+            self.register(detection)
+
+        # Increment disappeared counter for unmatched existing objects
+        matched_object_ids = {object_id for object_id, _ in matches}
+        for object_id in self.objects:
+            if object_id not in matched_object_ids:
+                self.disappeared[object_id] += 1
+
+    def _log_immediate_crossing(self, obj, from_zone, to_zone):
+        """Log an immediate crossing trigger event."""
+        trigger_type = "vehicle_violation" if obj['object_type'] in ['car', 'truck', 'bus', 'motorcycle'] else "pedestrian_crossing"
+
+        crossing_event = {
+            'timestamp': datetime.now().isoformat(),
+            'object_type': obj['object_type'],
+            'trigger_type': trigger_type,
+            'from_zone': from_zone,
+            'to_zone': to_zone,
+            'confidence': obj['detection'].conf if obj['detection'] else 0.0,
+            'detection_time': obj['last_seen']
+        }
+
+        # Log the crossing through the monitor
+        app.crosswalk_monitor.log_immediate_crossing(crossing_event)
+
+        # Print immediate feedback
+        if trigger_type == "vehicle_violation":
+            print(f"🚗 VEHICLE CROSSING: {obj['object_type']} from {from_zone} → {to_zone} (conf: {crossing_event['confidence']:.2f})")
         else:
-            for detection in detections:
-                # Very simple matching to one object for now
-                if self.objects:
-                    object_id = list(self.objects.keys())[0]
-                    obj = self.objects[object_id]
-
-                    prev_zones = obj['zone_history'][-1] if obj['zone_history'] else None
-
-                    # Determine current zone(s) for this detection
-                    current_zones = []
-                    for zone_name, zone in zones.items():
-                        if zone.contains_detection(detection):
-                            current_zones.append(zone_name)
-
-                    # Pick just one (or extend to support multiple later)
-                    current_zone = current_zones[0] if current_zones else None
-
-                    # Check for zone transition
-                    if prev_zones and current_zone and prev_zones != current_zone:
-                        app.crosswalk_monitor.log_crossing_event(
-                            object_type=get_labels(app)[int(detection.category)],
-                            zone_from=prev_zones,
-                            zone_to=current_zone,
-                            confidence=detection.conf
-                        )
-
-                    # Update the object
-                    obj['detection'] = detection
-                    obj['last_seen'] = time.time()
-                    self.disappeared[object_id] = 0
-                    if current_zone:
-                        obj['zone_history'].append(current_zone)
+            print(f"🚶 PEDESTRIAN CROSSING: {obj['object_type']} entering crosswalk from {from_zone} (conf: {crossing_event['confidence']:.2f})")
 
 class CrosswalkMonitor:
     """Main crosswalk monitoring system for detecting and logging crossing events."""
-    
+
     def __init__(self):
         """Initialize the crosswalk monitoring system."""
         self.zones = {}
-        max_disappeared = get_system_setting('max_disappeared_frames', 10)
-        self.tracker = ObjectTracker(max_disappeared)
+        max_disappeared = get_system_setting('max_disappeared_frames', 5)  # Shorter for unreliable detection
+        max_distance = get_system_setting('max_tracking_distance', 100)
+        self.tracker = TriggerBasedTracker(max_disappeared, max_distance)
         max_events = get_system_setting('max_crossing_events', 1000)
         self.crossing_events = deque(maxlen=max_events)
         self.stats = defaultdict(int)
         self.log_path = None
+
+        # Separate log files for different entity types
+        self.log_files = {
+            'pedestrian': None,  # Will be set in setup
+            'vehicle': None,     # Will be set in setup
+            'all': None         # Combined log
+        }
         
     def setup_zones_from_metasettings(self, frame_width, frame_height):
         """
@@ -219,11 +405,128 @@ class CrosswalkMonitor:
                 for (x, y) in norm_points
             ]
             self.zones[key] = CrosswalkZone(name, abs_points)
-        
+
+    def setup_log_files(self, base_log_path, zone_config_name):
+        """
+        Setup separate log files for different entity types in organized folders.
+
+        Args:
+            base_log_path: Base path for log files
+            zone_config_name: Name of the zone configuration for folder organization
+        """
+        import os
+        from pathlib import Path
+
+        base_path = Path(base_log_path)
+        base_log_dir = base_path.parent
+        base_name = base_path.stem
+
+        # Create zone-specific log directory
+        zone_log_dir = base_log_dir / zone_config_name
+        zone_log_dir.mkdir(parents=True, exist_ok=True)
+
+        # Create separate log files in the zone directory
+        self.log_files['pedestrian'] = zone_log_dir / f"{base_name}_pedestrians.jsonl"
+        self.log_files['vehicle'] = zone_log_dir / f"{base_name}_vehicles.jsonl"
+        self.log_files['all'] = zone_log_dir / f"{base_name}_all.jsonl"
+
+        # Create log files with headers
+        for log_type, log_path in self.log_files.items():
+            if log_path and not log_path.exists():
+                with open(log_path, 'w') as f:
+                    header = {
+                        'log_type': log_type,
+                        'zone_config': zone_config_name,
+                        'created': datetime.now().isoformat(),
+                        'description': f'Crosswalk crossing events for {log_type} in {zone_config_name}'
+                    }
+                    f.write(json.dumps(header, default=self._json_serializer) + '\n')
+
+        print(f"Log files setup for zone '{zone_config_name}':")
+        print(f"  Directory: {zone_log_dir}")
+        print(f"  Pedestrians: {self.log_files['pedestrian'].name}")
+        print(f"  Vehicles: {self.log_files['vehicle'].name}")
+        print(f"  All events: {self.log_files['all'].name}")
+
+    def _categorize_object_type(self, object_type):
+        """
+        Categorize object type into pedestrian, vehicle, or other.
+
+        Args:
+            object_type: The detected object type
+
+        Returns:
+            Category string: 'pedestrian', 'vehicle', or 'other'
+        """
+        pedestrian_types = ['person', 'pedestrian']
+        vehicle_types = ['car', 'truck', 'bus', 'bicycle', 'motorcycle', 'vehicle']
+
+        if object_type.lower() in pedestrian_types:
+            return 'pedestrian'
+        elif object_type.lower() in vehicle_types:
+            return 'vehicle'
+        else:
+            return 'other'
+
+    def _json_serializer(self, obj):
+        """
+        Custom JSON serializer to handle NumPy data types.
+
+        Args:
+            obj: Object to serialize
+
+        Returns:
+            JSON-serializable version of the object
+        """
+        import numpy as np
+
+        if isinstance(obj, np.floating):
+            return float(obj)
+        elif isinstance(obj, np.integer):
+            return int(obj)
+        elif isinstance(obj, np.ndarray):
+            return obj.tolist()
+
+        raise TypeError(f"Object of type {type(obj)} is not JSON serializable")
+
+    def log_immediate_crossing(self, crossing_event):
+        """
+        Log an immediate crossing trigger event to appropriate files.
+
+        Args:
+            crossing_event: Dictionary containing crossing trigger information
+        """
+        # Categorize the object
+        category = self._categorize_object_type(crossing_event['object_type'])
+        crossing_event['category'] = category
+
+        # Update statistics
+        self.stats[f'{crossing_event["trigger_type"]}_events'] += 1
+        self.stats[f'{category}_triggers'] += 1
+        self.stats['total_triggers'] += 1
+
+        # Add trigger to in-memory storage
+        self.crossing_events.append(crossing_event)
+
+        # Write to appropriate log files
+        log_paths = [self.log_files['all']]  # Always log to main file
+
+        if category in self.log_files:
+            log_paths.append(self.log_files[category])
+
+        for log_path in log_paths:
+            if log_path:
+                try:
+                    with open(log_path, 'a') as f:
+                        f.write(json.dumps(crossing_event, default=self._json_serializer) + '\n')
+                except Exception as e:
+                    print(f"Error writing trigger event to {log_path}: {e}")
+
+
     def log_crossing_event(self, object_type, zone_from, zone_to, confidence):
         """
-        Log a zone crossing event to file and update statistics.
-        
+        Legacy method - Log a simple zone transition event.
+
         Args:
             object_type: Type of object that crossed (e.g., 'person', 'car')
             zone_from: Zone the object moved from
@@ -235,16 +538,22 @@ class CrosswalkMonitor:
             'object_type': object_type,
             'from_zone': zone_from,
             'to_zone': zone_to,
-            'confidence': float(confidence)
+            'confidence': float(confidence),
+            'event_type': 'zone_transition'
         }
         self.crossing_events.append(event)
-        self.stats[f'{object_type}_crossings'] += 1
-        
+        self.stats[f'{object_type}_transitions'] += 1
+
         # Print to console for real-time monitoring
-        print(f"CROSSING DETECTED: {object_type} from {zone_from} to {zone_to} (conf: {confidence:.2f})")
-        
-        with open(self.log_path, 'a') as f:
-            f.write(json.dumps(event) + '\n')
+        print(f"ZONE TRANSITION: {object_type} from {zone_from} to {zone_to} (conf: {confidence:.2f})")
+
+        # Write to main log file only
+        if self.log_files['all']:
+            try:
+                with open(self.log_files['all'], 'a') as f:
+                    f.write(json.dumps(event, default=self._json_serializer) + '\n')
+            except Exception as e:
+                print(f"Error writing transition event: {e}")
     
     def analyze_detections(self, detections):
         """
@@ -267,18 +576,31 @@ class CrosswalkMonitor:
                     if zone.contains_detection(detection):
                         current_zones.append(zone_name)
                 
-                # Simple crossing detection (in production, use the tracker)
+                # Legacy detection output (reduced spam for stationary objects)
                 if current_zones:
+                    # Only print occasional updates for objects in crosswalk to reduce spam
+                    import time
+                    if not hasattr(self, '_last_zone_print'):
+                        self._last_zone_print = {}
+
                     zone_str = '+'.join(current_zones)
-                    print(f"{object_type} in {zone_str} (conf: {detection.conf:.2f})")
-                    
-                    # Example: detect pedestrian in crosswalk
-                    if 'crosswalk' in current_zones and object_type == 'person':
-                        print(f"PEDESTRIAN IN CROSSWALK! (confidence: {detection.conf:.2f})")
-                    
-                    # Example: detect vehicle in crosswalk (potential violation)
-                    if 'crosswalk' in current_zones and object_type in ['car', 'truck', 'bus']:
-                        print(f"VEHICLE IN CROSSWALK! (confidence: {detection.conf:.2f})")
+                    current_time = time.time()
+
+                    # Only print every 5 seconds for the same object type in same zone
+                    print_key = f"{object_type}_{zone_str}"
+                    if (print_key not in self._last_zone_print or
+                        current_time - self._last_zone_print[print_key] > 5.0):
+
+                        self._last_zone_print[print_key] = current_time
+
+                        # Only print if it's an interesting zone combination
+                        if 'crosswalk' in current_zones:
+                            if object_type == 'person':
+                                print(f"PEDESTRIAN IN CROSSWALK (confidence: {detection.conf:.2f})")
+                            elif object_type in ['car', 'truck', 'bus']:
+                                print(f"VEHICLE IN CROSSWALK (confidence: {detection.conf:.2f})")
+                        # For debugging: comment out this line to reduce general zone spam
+                        # print(f"{object_type} in {zone_str} (conf: {detection.conf:.2f})")
 
 class CrosswalkDetectionApp:
     """Main application class for crosswalk detection system"""
@@ -457,11 +779,17 @@ def parse_detections(metadata: dict, app_instance, args):
         boxes = np.array_split(boxes, 4, axis=1)
         boxes = zip(*boxes)
 
-    app_instance.last_detections = [
-        Detection(box, category, score, metadata)
-        for box, score, category in zip(boxes, scores, classes)
-        if score > threshold
-    ]
+    # Apply per-object detection thresholds
+    labels = get_labels(app_instance)
+    filtered_detections = []
+    for box, score, category in zip(boxes, scores, classes):
+        object_type = labels[int(category)]
+        object_threshold = get_detection_threshold(object_type)
+
+        if score > object_threshold:
+            filtered_detections.append(Detection(box, category, score, metadata))
+
+    app_instance.last_detections = filtered_detections
     
     # Analyze detections for crosswalk activity
     app_instance.crosswalk_monitor.analyze_detections(app_instance.last_detections)
@@ -522,10 +850,13 @@ def draw_detections_on_array(frame, detections, zones):
         # Draw detection box
         cv2.rectangle(frame, (x, y), (x + w, y + h), color, thickness=2)
         
-        # Draw center point
+        # Draw weighted detection point (75% down from top)
         center_x = x + w // 2
-        center_y = y + h // 2
-        cv2.circle(frame, (center_x, center_y), radius=3, color=color, thickness=-1)
+        center_y = y + int(h * 0.75)  # Weighted lower for better vehicle detection
+        cv2.circle(frame, (center_x, center_y), radius=4, color=color, thickness=-1)
+
+        # Draw a small marker to show this is the detection point
+        cv2.circle(frame, (center_x, center_y), radius=6, color=(255, 255, 255), thickness=1)
         
         # Draw label with background
         (text_width, text_height), baseline = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
@@ -577,12 +908,15 @@ def main():
     # Get settings from metasettings
     imx_model = get_system_setting('imx_model_path')
     log_path = get_log_path()
-    app.crosswalk_monitor.log_path = str(log_path)
-    
+
     # Get active zone configuration info
     zone_config = get_active_zone_config()
-    print(f"Using zone configuration: {zone_config['name']}")
+    zone_config_name = zone_config['name']
+    print(f"Using zone configuration: {zone_config_name}")
     print(f"Description: {zone_config['description']}")
+
+    # Setup separate log files for different entity types
+    app.crosswalk_monitor.setup_log_files(str(log_path), zone_config_name)
 
     # This must be called before instantiation of Picamera2
     app.imx500 = IMX500(imx_model)
@@ -633,8 +967,23 @@ def main():
     
     print(f"Crosswalk Monitor Started!")
     print(f"Camera Resolution: {frame_width}x{frame_height}")
-    print(f"Detection Threshold: {args.threshold}")
+    print(f"Default Detection Threshold: {args.threshold}")
+
+    # Show per-object thresholds
+    object_thresholds = get_system_setting('object_thresholds', {})
+    if object_thresholds:
+        print("Per-object Detection Thresholds:")
+        for obj_type, threshold in object_thresholds.items():
+            print(f"  {obj_type}: {threshold}")
+
     print(f"Logs will be saved to: {log_path}")
+    print("="*50)
+
+    # TODO reminder for developer
+    print("📝 TODO: Implement proper pedestrian crossing logic!")
+    print("   Current system only detects pedestrians entering crosswalk.")
+    print("   Need to add: direction tracking, crossing completion detection,")
+    print("   and pedestrian-specific safety alerts.")
     print("="*50)
 
     # Start web server
@@ -685,7 +1034,17 @@ def main():
     except KeyboardInterrupt:
         print("\nCrosswalk Monitor Stopped")
         print(f"Total Events Logged: {len(app.crosswalk_monitor.crossing_events)}")
-        print(f"Logs saved to: {log_path}")
+
+        # Print detailed statistics
+        print("\nCrossing Statistics:")
+        for stat_name, count in app.crosswalk_monitor.stats.items():
+            print(f"  {stat_name}: {count}")
+
+        print(f"\nLogs saved to:")
+        for log_type, log_path in app.crosswalk_monitor.log_files.items():
+            if log_path:
+                print(f"  {log_type}: {log_path}")
+
         app.picam2.stop()
 
 if __name__ == "__main__":
