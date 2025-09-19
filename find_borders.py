@@ -213,9 +213,7 @@ class CoordinateHandler(BaseHTTPRequestHandler):
                 <div class="instructions">
                     <h3>Instructions:</h3>
                     <ul>
-                        <li><strong>Click on the image</strong> to get pixel coordinates</li>
                         <li>Zone boundaries are overlaid in different colors (if configured)</li>
-                        <li>Use these coordinates to define zones in your crosswalk detector</li>
                         <li>Camera resolution: {self.app.frame_width}x{self.app.frame_height}</li>
                         <li>For normalized coordinates (0.0-1.0), divide X by {self.app.frame_width} and Y by {self.app.frame_height}</li>
                     </ul>
@@ -224,13 +222,7 @@ class CoordinateHandler(BaseHTTPRequestHandler):
                     <img id="stream" class="clickable-image" src="/stream.mjpg" alt="Camera Feed">
                 </div>
                 <div class="controls">
-                    <button onclick="clearPoints()">Clear Points</button>
                     <button onclick="toggleGrid()">Show Grid</button>
-                    <button onclick="copyCoordinates()">Copy Last Point</button>
-                </div>
-                <div class="coordinates" id="coordinates">
-                    <strong>Clicked Coordinates:</strong><br>
-                    Click on the image above to see coordinates here...
                 </div>
                 <div class="stats">
                     <strong>Loaded Zones:</strong><br>
@@ -252,38 +244,6 @@ class CoordinateHandler(BaseHTTPRequestHandler):
                     const streamImg = document.getElementById('stream');
                     if (!streamImg) return;
 
-                    streamImg.addEventListener('click', function(e) {{
-                        const rect = this.getBoundingClientRect();
-                        const scaleX = {self.app.frame_width} / rect.width;
-                        const scaleY = {self.app.frame_height} / rect.height;
-
-                        const x = Math.round((e.clientX - rect.left) * scaleX);
-                        const y = Math.round((e.clientY - rect.top) * scaleY);
-
-                        console.log('Click detected:', x, y);
-
-                        // Send click to server
-                        fetch(`/click?x=${{x}}&y=${{y}}`)
-                            .then(response => {{
-                                if (!response.ok) {{
-                                    throw new Error('Network response was not ok');
-                                }}
-                                return response.json();
-                            }})
-                            .then(data => {{
-                                console.log('Server response:', data);
-                                if (data.status === 'ok') {{
-                                    lastClickedPoint = {{x: data.x, y: data.y}};
-                                    updateCoordinatesDisplay();
-                                }}
-                            }})
-                            .catch(err => {{
-                                console.error('Error sending click:', err);
-                                // Still update display even if server fails
-                                lastClickedPoint = {{x: x, y: y}};
-                                updateCoordinatesDisplay();
-                            }});
-                    }});
 
                     // Handle image load to resize grid
                     streamImg.addEventListener('load', function() {{
@@ -392,39 +352,7 @@ class CoordinateHandler(BaseHTTPRequestHandler):
                     ctx.shadowOffsetY = 0;
                 }}
 
-                function updateCoordinatesDisplay() {{
-                    if (lastClickedPoint) {{
-                        const normalizedX = (lastClickedPoint.x / {self.app.frame_width}).toFixed(3);
-                        const normalizedY = (lastClickedPoint.y / {self.app.frame_height}).toFixed(3);
 
-                        const coordsDiv = document.getElementById('coordinates');
-                        if (coordsDiv) {{
-                            const timestamp = new Date().toLocaleTimeString();
-                            const newCoord = `<br>[${{timestamp}}] Pixel: (${{lastClickedPoint.x}}, ${{lastClickedPoint.y}}) | Normalized: (${{normalizedX}}, ${{normalizedY}})`;
-
-                            // If this is the first coordinate, replace the placeholder text
-                            if (coordsDiv.innerHTML.includes('Click on the image above')) {{
-                                coordsDiv.innerHTML = '<strong>Clicked Coordinates:</strong>' + newCoord;
-                            }} else {{
-                                coordsDiv.innerHTML += newCoord;
-                            }}
-                            coordsDiv.scrollTop = coordsDiv.scrollHeight;
-                        }}
-                    }}
-                }}
-
-                function clearPoints() {{
-                    fetch('/clear')
-                        .then(response => response.json())
-                        .then(data => {{
-                            const coordsDiv = document.getElementById('coordinates');
-                            if (coordsDiv) {{
-                                coordsDiv.innerHTML = '<strong>Clicked Coordinates:</strong><br>Cleared all points...';
-                            }}
-                            lastClickedPoint = null;
-                        }})
-                        .catch(err => console.error('Error clearing points:', err));
-                }}
 
                 function toggleGrid() {{
                     showGrid = !showGrid;
@@ -441,20 +369,6 @@ class CoordinateHandler(BaseHTTPRequestHandler):
                     button.style.background = showGrid ? '#ff6b6b' : '#ffcc00';
                 }}
 
-                function copyCoordinates() {{
-                    if (lastClickedPoint) {{
-                        const text = `(${{lastClickedPoint.x}}, ${{lastClickedPoint.y}})`;
-                        navigator.clipboard.writeText(text).then(() => {{
-                            alert('Coordinates copied to clipboard: ' + text);
-                        }}).catch(err => {{
-                            // Fallback for older browsers
-                            console.error('Clipboard copy failed:', err);
-                            prompt('Copy these coordinates:', text);
-                        }});
-                    }} else {{
-                        alert('No coordinates to copy. Click on the image first.');
-                    }}
-                }}
 
                 // Auto-refresh if stream fails
                 document.getElementById('stream').addEventListener('error', function() {{
