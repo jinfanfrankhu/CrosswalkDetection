@@ -50,6 +50,18 @@ SYSTEM_CONFIG = {
     "max_disappeared_frames": 5,   # Shorter timeout for unreliable detection
     "max_tracking_distance": 100,
     "max_crossing_events": 1000,
+
+    # Enhanced Detection Settings
+    "enable_roi_detection": True,    # Enable ROI-based enhanced detection
+    "roi_scale_factor": 2.5,         # Scale factor for ROI upscaling (2.5x default)
+    "roi_object_types": ['person', 'bicycle'],  # Objects to detect in ROI enhancement
+
+    # YOLO Settings for ROI Enhancement
+    "yolo_model_path": str(BASE_DIR / "YOLO_models" / "yolov8n.onnx"),
+    "yolo_confidence_threshold": 0.3,  # Lower threshold for distant pedestrians
+    "yolo_nms_threshold": 0.4,         # Non-maximum suppression threshold
+    "yolo_input_size": 640,            # YOLOv8 input image size
+    "yolo_person_class_id": 0,         # COCO dataset person class ID
     
     # Relevant object types for tracking
     "tracked_objects": ['person', 'car', 'truck', 'bus', 'bicycle', 'motorcycle'],

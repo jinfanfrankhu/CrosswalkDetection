@@ -131,6 +131,7 @@ class TriggerBasedTracker:
             'current_zone': None,
             'last_zone': None,
             'position': (center_x, center_y),
+            'position_history': [(center_x, center_y)],  # Add position history
             'first_seen': time.time(),
             'last_seen': time.time(),
             'object_type': None
@@ -305,6 +306,14 @@ class TriggerBasedTracker:
             obj['last_seen'] = time.time()
             obj['object_type'] = labels[int(detection.category)]
             obj['position'] = detection_center
+
+            # Update position history (keep last 10 positions)
+            if 'position_history' not in obj:
+                obj['position_history'] = []
+            obj['position_history'].append(detection_center)
+            if len(obj['position_history']) > 10:
+                obj['position_history'] = obj['position_history'][-10:]
+
             self.disappeared[object_id] = 0
 
             # Determine current zone for this detection
@@ -604,7 +613,7 @@ class CrosswalkMonitor:
 
 class CrosswalkDetectionApp:
     """Main application class for crosswalk detection system"""
-    
+
     def __init__(self):
         self.last_detections = []
         self.latest_frame = None
@@ -613,6 +622,30 @@ class CrosswalkDetectionApp:
         self.imx500 = None
         self.intrinsics = None
         self.picam2 = None
+        self.yolo_net = None
+
+    def load_yolo_model(self):
+        """Load YOLOv8 model for ROI enhancement"""
+        try:
+            yolo_model_path = get_system_setting('yolo_model_path')
+            if not os.path.exists(yolo_model_path):
+                print(f"Warning: YOLO model not found at {yolo_model_path}")
+                print("ROI enhancement will be disabled")
+                return False
+
+            self.yolo_net = cv2.dnn.readNetFromONNX(yolo_model_path)
+
+            # Set computation backend (CPU or GPU if available)
+            self.yolo_net.setPreferableBackend(cv2.dnn.DNN_BACKEND_OPENCV)
+            self.yolo_net.setPreferableTarget(cv2.dnn.DNN_TARGET_CPU)
+
+            print(f"✅ YOLOv8n model loaded successfully from {yolo_model_path}")
+            return True
+
+        except Exception as e:
+            print(f"❌ Error loading YOLO model: {e}")
+            print("ROI enhancement will be disabled")
+            return False
         
     def get_latest_frame(self):
         """Thread-safe method to get the latest frame"""
@@ -750,6 +783,296 @@ class StreamingHandler(BaseHTTPRequestHandler):
             except Exception as e:
                 print(f"Streaming error: {e}")
                 break
+
+def get_crosswalk_roi_bounds(zones):
+    """
+    Get bounding rectangle for all crosswalk zones.
+
+    Args:
+        zones: Dictionary of zone_name -> CrosswalkZone objects
+
+    Returns:
+        tuple: (x, y, width, height) bounding rectangle or None if no crosswalk zones
+    """
+    crosswalk_zones = {name: zone for name, zone in zones.items() if 'crosswalk' in name.lower()}
+
+    if not crosswalk_zones:
+        return None
+
+    # Collect all points from all crosswalk zones
+    all_points = []
+    for zone in crosswalk_zones.values():
+        all_points.extend(zone.points)
+
+    if not all_points:
+        return None
+
+    # Find bounding rectangle
+    all_points = np.array(all_points)
+    min_x = int(np.min(all_points[:, 0]))
+    max_x = int(np.max(all_points[:, 0]))
+    min_y = int(np.min(all_points[:, 1]))
+    max_y = int(np.max(all_points[:, 1]))
+
+    return (min_x, min_y, max_x - min_x, max_y - min_y)
+
+def merge_detections(full_frame_detections, roi_detections):
+    """
+    Merge full frame and ROI detections, avoiding duplicates.
+
+    Args:
+        full_frame_detections: List of Detection objects from full frame
+        roi_detections: List of Detection objects from ROI enhancement
+
+    Returns:
+        list: Merged list of detections with duplicates removed
+    """
+    if not roi_detections:
+        return full_frame_detections
+
+    # Start with full frame detections
+    merged_detections = list(full_frame_detections)
+    labels = get_labels(app)
+    roi_object_types = get_system_setting('roi_object_types', ['person', 'bicycle'])
+
+    # Add ROI detections that don't overlap significantly with existing ones
+    for roi_det in roi_detections:
+        object_type = labels[int(roi_det.category)]
+
+        # Only merge person/bicycle detections from ROI
+        if object_type not in roi_object_types:
+            continue
+
+        is_duplicate = False
+        roi_box = roi_det.box
+
+        # Check for overlap with existing detections
+        for existing_det in full_frame_detections:
+            existing_object_type = labels[int(existing_det.category)]
+
+            # Only check against same object types
+            if existing_object_type != object_type:
+                continue
+
+            existing_box = existing_det.box
+
+            # Calculate IoU (Intersection over Union)
+            iou = calculate_iou(roi_box, existing_box)
+
+            # If IoU > 0.5, consider it a duplicate and keep the higher confidence one
+            if iou > 0.5:
+                if roi_det.conf > existing_det.conf:
+                    # Replace existing with ROI detection (higher confidence)
+                    merged_detections.remove(existing_det)
+                    merged_detections.append(roi_det)
+                is_duplicate = True
+                break
+
+        # If not a duplicate, add the ROI detection
+        if not is_duplicate:
+            merged_detections.append(roi_det)
+
+    return merged_detections
+
+def calculate_iou(box1, box2):
+    """
+    Calculate Intersection over Union (IoU) of two bounding boxes.
+
+    Args:
+        box1, box2: [x, y, width, height] format
+
+    Returns:
+        float: IoU value between 0 and 1
+    """
+    x1, y1, w1, h1 = box1
+    x2, y2, w2, h2 = box2
+
+    # Calculate intersection coordinates
+    x_left = max(x1, x2)
+    y_top = max(y1, y2)
+    x_right = min(x1 + w1, x2 + w2)
+    y_bottom = min(y1 + h1, y2 + h2)
+
+    # No intersection
+    if x_right < x_left or y_bottom < y_top:
+        return 0.0
+
+    # Calculate intersection area
+    intersection_area = (x_right - x_left) * (y_bottom - y_top)
+
+    # Calculate union area
+    box1_area = w1 * h1
+    box2_area = w2 * h2
+    union_area = box1_area + box2_area - intersection_area
+
+    # Avoid division by zero
+    if union_area == 0:
+        return 0.0
+
+    return intersection_area / union_area
+
+def run_enhanced_roi_detection(frame, roi_bounds, scale_factor, app_instance, args):
+    """
+    Run YOLOv8 detection on upscaled crosswalk ROI to catch distant pedestrians.
+
+    Args:
+        frame: Full frame (BGR format)
+        roi_bounds: (x, y, width, height) of ROI in full frame
+        scale_factor: Scale factor to upscale ROI
+        app_instance: CrosswalkDetectionApp instance
+        args: Command line arguments
+
+    Returns:
+        list: Detection objects with coordinates mapped back to full frame
+    """
+    roi_detections = []
+
+    # Check if YOLO model is loaded
+    if app_instance.yolo_net is None:
+        return []
+
+    try:
+        x, y, w, h = roi_bounds
+
+        # Extract and upscale ROI
+        roi = frame[y:y+h, x:x+w]
+        if roi.size == 0:
+            return []
+
+        scaled_w = int(w * scale_factor)
+        scaled_h = int(h * scale_factor)
+        upscaled_roi = cv2.resize(roi, (scaled_w, scaled_h))
+
+        # Prepare input for YOLO
+        input_size = get_system_setting('yolo_input_size', 640)
+        blob = cv2.dnn.blobFromImage(
+            upscaled_roi,
+            1/255.0,  # Scale factor to normalize pixel values
+            (input_size, input_size),
+            swapRB=True,  # OpenCV uses BGR, YOLO expects RGB
+            crop=False
+        )
+
+        # Run YOLO inference
+        app_instance.yolo_net.setInput(blob)
+        outputs = app_instance.yolo_net.forward()
+
+        # Parse YOLO outputs
+        roi_detections = parse_yolo_outputs(
+            outputs, upscaled_roi.shape, roi_bounds, scale_factor, app_instance
+        )
+
+        # Optional: Log YOLO detections (uncomment if needed for debugging)
+        # if roi_detections:
+        #     print(f"YOLO ROI: Found {len(roi_detections)} pedestrians in crosswalk area")
+
+    except Exception as e:
+        print(f"YOLO ROI detection error: {e}")
+
+    return roi_detections
+
+def parse_yolo_outputs(outputs, roi_shape, roi_bounds, scale_factor, app_instance):
+    """
+    Parse YOLOv8 outputs and convert to Detection objects with full-frame coordinates.
+
+    Args:
+        outputs: YOLO model output tensor
+        roi_shape: Shape of the upscaled ROI (height, width, channels)
+        roi_bounds: (x, y, width, height) of ROI in full frame
+        scale_factor: Scale factor used for ROI upscaling
+        app_instance: CrosswalkDetectionApp instance
+
+    Returns:
+        list: Detection objects mapped to full frame coordinates
+    """
+    detections = []
+
+    try:
+        # YOLOv8 output format can vary, let's handle both formats
+        output = outputs[0]
+
+        # Handle different output formats
+        if len(output.shape) == 3:
+            # Format: [1, 84, 8400] -> transpose to [1, 8400, 84]
+            output = output.transpose(0, 2, 1)
+
+        # Now should be [1, 8400, 84] format
+        if len(output.shape) == 3:
+            output = output[0]  # Remove batch dimension -> [8400, 84]
+
+        # Get settings
+        conf_threshold = get_system_setting('yolo_confidence_threshold', 0.3)
+        nms_threshold = get_system_setting('yolo_nms_threshold', 0.4)
+        person_class_id = get_system_setting('yolo_person_class_id', 0)
+
+        # Parse detections
+        boxes = []
+        confidences = []
+        class_ids = []
+
+        roi_x, roi_y, roi_w, roi_h = roi_bounds
+        roi_height, roi_width = roi_shape[:2]
+        input_size = get_system_setting('yolo_input_size', 640)
+
+        # YOLOv8 output format: [cx, cy, w, h, class0_conf, class1_conf, ...]
+        for i in range(output.shape[0]):
+            detection = output[i, :]
+
+            # Extract bbox coordinates (normalized to input size)
+            cx, cy, width, height = detection[:4]
+
+            # Get person class confidence
+            person_confidence = detection[4 + person_class_id]
+
+            if person_confidence > conf_threshold:
+                # Convert from normalized coordinates to input image pixel coordinates
+                x = (cx - width/2) * input_size / input_size * roi_width
+                y = (cy - height/2) * input_size / input_size * roi_height
+                w = width * input_size / input_size * roi_width
+                h = height * input_size / input_size * roi_height
+
+                # Scale down from upscaled ROI to original ROI size
+                x = x / scale_factor
+                y = y / scale_factor
+                w = w / scale_factor
+                h = h / scale_factor
+
+                # Map to full frame coordinates
+                x_full = int(x + roi_x)
+                y_full = int(y + roi_y)
+                w_full = int(w)
+                h_full = int(h)
+
+                # Bounds checking
+                if x_full >= 0 and y_full >= 0 and w_full > 0 and h_full > 0:
+                    boxes.append([x_full, y_full, w_full, h_full])
+                    confidences.append(float(person_confidence))
+                    class_ids.append(person_class_id)
+
+        # Apply Non-Maximum Suppression
+        if boxes:
+            indices = cv2.dnn.NMSBoxes(boxes, confidences, conf_threshold, nms_threshold)
+
+            if len(indices) > 0:
+                indices = indices.flatten()
+
+                for i in indices:
+                    x, y, w, h = boxes[i]
+                    confidence = confidences[i]
+
+                    # Create Detection-like object for person
+                    detection = type('Detection', (), {
+                        'box': [x, y, w, h],
+                        'category': person_class_id,
+                        'conf': confidence
+                    })()
+
+                    detections.append(detection)
+
+    except Exception as e:
+        print(f"Error parsing YOLO outputs: {e}")
+
+    return detections
 
 def parse_detections(metadata: dict, app_instance, args):
     """Parse the output tensor into a number of detected objects, scaled to the ISP output."""
@@ -928,6 +1251,11 @@ def main():
         print("Network is not an object detection task", file=sys.stderr)
         exit()
 
+    # Load YOLO model for ROI enhancement
+    if get_system_setting('enable_roi_detection', True):
+        print("Loading YOLOv8 model for ROI enhancement...")
+        app.load_yolo_model()
+
     # Override intrinsics from args
     for key, value in vars(args).items():
         if key == 'labels' and value is not None:
@@ -979,13 +1307,6 @@ def main():
     print(f"Logs will be saved to: {log_path}")
     print("="*50)
 
-    # TODO reminder for developer
-    print("📝 TODO: Implement proper pedestrian crossing logic!")
-    print("   Current system only detects pedestrians entering crosswalk.")
-    print("   Need to add: direction tracking, crossing completion detection,")
-    print("   and pedestrian-specific safety alerts.")
-    print("="*50)
-
     # Start web server
     web_port = args.web_port if args.web_port else get_system_setting('web_port', 8080)
     web_server = WebServer(app)
@@ -1004,6 +1325,29 @@ def main():
         while True:
             metadata = app.picam2.capture_metadata()
             last_results = parse_detections(metadata, app, args)
+
+            # Enhanced ROI detection for crosswalk areas
+            roi_detections = []
+            if get_system_setting('enable_roi_detection', True):
+                try:
+                    # Get current frame for ROI processing
+                    frame = app.picam2.capture_array()
+                    frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+
+                    # Get ROI bounds for crosswalk zones
+                    roi_bounds = get_crosswalk_roi_bounds(app.crosswalk_monitor.zones)
+
+                    if roi_bounds is not None:
+                        scale_factor = get_system_setting('roi_scale_factor', 2.5)
+                        roi_detections = run_enhanced_roi_detection(
+                            frame, roi_bounds, scale_factor, app, args
+                        )
+
+                        # Merge ROI detections with full frame detections
+                        last_results = merge_detections(last_results, roi_detections)
+
+                except Exception as e:
+                    print(f"ROI detection error: {e}")
 
             # Filter only relevant types
             filtered = []
