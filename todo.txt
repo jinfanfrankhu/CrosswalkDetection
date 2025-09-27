@@ -88,9 +88,9 @@ CURRENT LIMITATIONS & NEXT STEPS:
    Priority: MEDIUM - Support for new crossing logic
 
    1. Add directional zone support to metasettings.py
-   2. Update find_borders.py to handle multiple zones efficiently
-   3. Create zone templates for common crosswalk layouts
-   4. Add zone validation and ordering checks
+   2. Add logic to logging zones
+   3. Make sure YOLO8 model usage in crosswalk_detector.py lines up with new zones (blow up borders of pedestrian zones too)
+   
 
 [TODO] TRACKING RELIABILITY IMPROVEMENTS:
    Priority: MEDIUM - Better object persistence
